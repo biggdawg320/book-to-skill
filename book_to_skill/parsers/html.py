@@ -85,6 +85,86 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
         return "".join(self._parts)
 
 
+def _bs4_get_text(soup) -> str:
+    """Block-aware replacement for ``soup.get_text(separator="\\n")``.
+
+    That call inserts the separator between every text node, not just at
+    block boundaries, so a styled chapter number ("Chapter <span>1</span>")
+    or a syntax-highlighted code token ("<span>print</span>") gains a
+    newline it never had in the source. Walk the tree instead, reusing
+    `_HTMLTextExtractor`'s tag sets so the bs4 and stdlib paths agree on
+    what counts as a boundary: only BLOCK_TAGS/CELL_TAGS elements emit a
+    separator, inline elements (span/b/i/a/...) do not, and whitespace
+    inside <pre> is kept verbatim rather than collapsed.
+
+    Comments, doctypes and processing instructions are NavigableString
+    subclasses too, but `soup.get_text()` does not include them -- skip
+    them here as well so a leading "<!DOCTYPE html>"/XML declaration or an
+    HTML comment does not leak into the extracted text.
+    """
+    from bs4 import (
+        Comment,
+        Declaration,
+        Doctype,
+        NavigableString,
+        ProcessingInstruction,
+        Tag,
+    )
+
+    NON_TEXT_STRING_TYPES = (Comment, Declaration, Doctype, ProcessingInstruction)
+
+    parts: list[str] = []
+    pending = ""
+
+    def mark(separator: str) -> None:
+        nonlocal pending
+        if separator == "\n" or not pending:
+            pending = separator
+
+    def emit(data: str) -> None:
+        nonlocal pending
+        if pending:
+            if parts:
+                parts.append(pending)
+            pending = ""
+        parts.append(data)
+
+    def walk(node, preformatted: bool) -> None:
+        if isinstance(node, NON_TEXT_STRING_TYPES):
+            return
+        if isinstance(node, NavigableString):
+            text = str(node)
+            # Mirrors _HTMLTextExtractor.handle_data: a whitespace-only run is
+            # only dropped while a boundary is still pending (layout
+            # indentation between tags) -- one sitting between two inline
+            # elements with no pending boundary ("<b>bold</b> <i>italic</i>")
+            # is real inter-word spacing and must survive.
+            if text and (preformatted or not pending or text.strip()):
+                emit(text)
+            return
+        if not isinstance(node, Tag):
+            return
+        name = node.name
+        if name in _HTMLTextExtractor.SKIP_TAGS:
+            return
+        is_block = name in _HTMLTextExtractor.BLOCK_TAGS
+        is_cell = name in _HTMLTextExtractor.CELL_TAGS
+        if is_block:
+            mark("\n")
+        elif is_cell:
+            mark("\t")
+        child_preformatted = preformatted or name == "pre"
+        for child in node.children:
+            walk(child, child_preformatted)
+        if is_block:
+            mark("\n")
+        elif is_cell:
+            mark("\t")
+
+    walk(soup, False)
+    return "".join(parts)
+
+
 def extract_html_content(raw_html: str) -> str:
     # Prints mirror extract_docx()'s "Trying X..." style so a run
     # says which of the three extractors actually answered, instead of
@@ -125,7 +205,7 @@ def extract_html_content(raw_html: str) -> str:
         for element in soup(["script", "style", "head"]):
             element.decompose()
         print("OK")
-        return soup.get_text(separator="\n")
+        return _bs4_get_text(soup)
     except ImportError:
         print("not available")
         print("Trying stdlib HTML parser...", end=" ", flush=True)
